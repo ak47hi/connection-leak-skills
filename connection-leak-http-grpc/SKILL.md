@@ -80,6 +80,117 @@ try (CloseableHttpResponse r = httpClient.execute(req)) {
 
 HttpClient 4.x is similar; missing `EntityUtils.consume` on the error path is the most common leak.
 
+### Java — Apache HttpAsyncClient 5
+
+HttpAsyncClient 5 has a different lifecycle than the sync client: you must call `start()` before the first request and `close(CloseMode.GRACEFUL)` (or `IMMEDIATE`) at shutdown. Forgetting `start()` leaks zero (the client errors out); forgetting `close()` leaks the I/O reactor's selector threads and any pooled connections.
+
+```sh
+rg -n 'HttpAsyncClients\.|CloseableHttpAsyncClient' --type java
+rg -n 'HttpAsyncClients\.custom\(\)' --type java -A 10 | rg -B 10 -v '\.start\(\)'
+```
+
+Per-request, `SimpleHttpRequest`/`SimpleHttpResponse` carry the body inline — but a `BasicHttpRequest` / `BasicResponseConsumer<HttpResponse>` does not. Async response consumers that don't drain (e.g., `AbstractBinResponseConsumer` left unconsumed because the future was cancelled before completion) hold the underlying stream open until the I/O reactor times them out.
+
+```java
+// CORRECT — graceful shutdown on the I/O reactor
+@PreDestroy
+public void close() throws IOException {
+    asyncClient.close(CloseMode.GRACEFUL);   // drains in-flight, waits for ack
+}
+```
+
+Mixed deployments (sync HttpClient 5 + async HttpAsyncClient 5 in the same service) confuse heap dumps — the class names differ (`CloseableHttpClient` vs `CloseableHttpAsyncClient`), so count both.
+
+### Java/Kotlin — Spring WebClient / reactor-netty
+
+This is the dominant JVM HTTP-leak source in Spring shops on Spring 5.3+ / Spring Boot 2.4+. Reactor-Netty exposes a connection pool (`ConnectionProvider`) with strict release semantics: the connection returns to the pool only when the response body is **fully consumed or explicitly released**. Several patterns leak silently:
+
+```sh
+# Per-request WebClient — the pool itself leaks because each WebClient gets its own ConnectionProvider
+rg -n 'WebClient\.create|WebClient\.builder\(\)' --type java --type kotlin
+
+# .retrieve() without terminal subscribe / proper body consumption
+rg -n '\.retrieve\(\)' --type java --type kotlin -A 3
+```
+
+Leak modes:
+
+```java
+// LEAK #1 — body not consumed on early return
+public Mono<String> fetch(String url) {
+    return webClient.get().uri(url).retrieve()
+        .toEntity(String.class)
+        .flatMap(resp -> {
+            if (!resp.getStatusCode().is2xxSuccessful()) {
+                return Mono.empty();   // body buffer not released
+            }
+            return Mono.just(resp.getBody());
+        });
+}
+
+// FIX — releaseBody() on the discard path
+public Mono<String> fetch(String url) {
+    return webClient.get().uri(url).exchangeToMono(resp -> {
+        if (!resp.statusCode().is2xxSuccessful()) {
+            return resp.releaseBody().then(Mono.empty());
+        }
+        return resp.bodyToMono(String.class);
+    });
+}
+```
+
+```java
+// LEAK #2 — WebClient created per call site, each one allocates a ConnectionProvider
+public Mono<String> fetch(String url) {
+    return WebClient.create().get().uri(url).retrieve().bodyToMono(String.class);
+}
+
+// FIX — singleton WebClient with a named, sized pool
+@Bean
+public WebClient httpWebClient() {
+    ConnectionProvider provider = ConnectionProvider.builder("app-http")
+        .maxConnections(100)
+        .pendingAcquireTimeout(Duration.ofSeconds(10))
+        .pendingAcquireMaxCount(500)
+        .maxIdleTime(Duration.ofSeconds(60))
+        .evictInBackground(Duration.ofSeconds(30))   // crucial for half-closed conn cleanup
+        .build();
+    HttpClient http = HttpClient.create(provider).responseTimeout(Duration.ofSeconds(5));
+    return WebClient.builder().clientConnector(new ReactorClientHttpConnector(http)).build();
+}
+```
+
+Leak signals from reactor-netty:
+
+- `reactor.netty.pool.PoolAcquireTimeoutException` in logs — pool exhausted (real leak or undersized).
+- `PrematureCloseException: Connection prematurely closed BEFORE response` — server closed mid-stream and the body was never fully released; FDs spike under upstream churn.
+- Reactor-Netty's own metric `reactor.netty.connection.provider.total.connections` climbing without bound = per-WebClient-instance leak.
+
+Streaming responses (`bodyToFlux(ByteBuffer.class)`) require the consumer to take every emission to completion or cancel the subscription. An abandoned `Flux` (no `.subscribe()` ever called) is a no-op; an abandoned `Disposable` from a subscribed `Flux` is a leak.
+
+### Java — gRPC keepalive misconfiguration as a leak amplifier
+
+A real gRPC leak (channel not shut down) is rare. The more common symptom — channels in `TRANSIENT_FAILURE` repeatedly recreated — is usually keepalive misconfiguration colliding with server-side limits.
+
+Default `gRPC-java` keepalive sends a HTTP/2 PING every `keepAliveTime` if there's no other traffic. If the client's `keepAliveTime` is shorter than the **server's** `permitKeepAliveTime` (default 5 min on grpc-java server), the server interprets the PINGs as a "too aggressive client" violation and sends `GOAWAY` with `ENHANCE_YOUR_CALM`. The client closes the channel and the underlying TCP connection — and the next RPC creates a fresh subchannel. From `lsof` this looks like a leak: ESTABLISHED count to the server fluctuates but the *count of distinct channel objects* in the heap grows because old ones aren't reclaimed promptly under load.
+
+```java
+// CORRECT — defaults that match grpc-java server defaults
+ManagedChannel channel = NettyChannelBuilder.forAddress(host, port)
+    .keepAliveTime(30, TimeUnit.SECONDS)   // server permit default is also conservative
+    .keepAliveTimeout(5, TimeUnit.SECONDS)
+    .keepAliveWithoutCalls(false)          // crucial: don't ping idle channels
+    .build();
+```
+
+Signals that you're in this hole, not a real leak:
+
+```sh
+grep -E 'ENHANCE_YOUR_CALM|too_many_pings|GOAWAY' <app-logs>
+```
+
+If you see those, fix keepalive before chasing FDs.
+
 ### Java — Netty / `ResourceLeakDetector`
 
 Netty tracks `ByteBuf` refcounts. A leak prints:
@@ -419,3 +530,49 @@ After the fix:
 3. The counts should oscillate around steady state, not climb monotonically.
 
 For per-client leaks, additionally heap-dump and verify singleton counts match expected.
+
+## Prevent
+
+Standing alerts for HTTP/gRPC socket-class leaks. Most rely on `node_exporter` netstat and per-app metrics if exposed.
+
+```yaml
+# ESTABLISHED to non-DB ports climbing — broad-spectrum HTTP socket leak
+- alert: PodTcpEstablishedClimbing
+  expr: |
+    deriv(node_netstat_Tcp_CurrEstab[15m]) > 0.5
+  for: 30m
+  annotations:
+    summary: "TCP ESTABLISHED count climbing on {{ $labels.instance }}"
+    runbook: "connection-leak-http-grpc: socket inventory by remote"
+
+# CLOSE_WAIT growth — almost always a missing close() in app code
+- alert: PodCloseWaitClimbing
+  expr: |
+    node_sockstat_TCP_inuse - node_netstat_Tcp_CurrEstab > 100
+  for: 10m
+  annotations:
+    summary: "{{ $labels.instance }} has >100 non-ESTABLISHED TCP sockets — likely CLOSE_WAIT"
+
+# Reactor-Netty connection pool — requires Micrometer reactor-netty binding enabled
+- alert: ReactorNettyPoolNearMax
+  expr: |
+    reactor_netty_connection_provider_total_connections
+    / reactor_netty_connection_provider_max_connections > 0.8
+  for: 5m
+
+# gRPC channel re-creation churn — keepalive misconfig vs real leak
+- alert: GrpcChannelRecreationChurn
+  expr: |
+    rate(grpc_client_channel_created_total[5m]) > 1
+  for: 10m
+  annotations:
+    summary: "{{ $labels.target }} grpc channels recreated >1/s — keepalive misconfig?"
+```
+
+The `node_sockstat_TCP_inuse - node_netstat_Tcp_CurrEstab` trick estimates CLOSE_WAIT+TIME_WAIT without needing a separate exporter; CLOSE_WAIT is the actionable component for application-side leaks.
+
+## Related
+
+- [`connection-leak-hunt`](../connection-leak-hunt/SKILL.md) — start here when the leak class is unclear; the `Not a leak` table rules out TIME_WAIT noise that mimics this skill's symptoms.
+- [`connection-leak-jdbc`](../connection-leak-jdbc/SKILL.md) — open in parallel when a Postgres `idle in transaction` alert fires alongside HTTP CLOSE_WAIT growth (same underlying root cause: slow upstream pins the DB conn).
+- [`connection-leak-flink`](../connection-leak-flink/SKILL.md) — open when the leaking process is a Flink TaskManager and the climbing sockets are AsyncIO clients or custom HTTP sinks.
