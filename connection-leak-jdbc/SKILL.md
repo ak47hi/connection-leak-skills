@@ -1,6 +1,6 @@
 ---
 name: connection-leak-jdbc
-description: Diagnose and fix JDBC and database connection pool leaks across Java, Kotlin, and Python. Use this skill whenever the user reports HikariCP `getConnection` timeouts, "Connection is not available, request timed out", `pg_stat_activity` showing idle-in-transaction climbing, MySQL `SHOW PROCESSLIST` filling with sleeping connections, SQLAlchemy "QueuePool limit overflow", asyncpg pool exhaustion, or any DB pool that drains under steady load. Covers source-code audit for missing close patterns and live-process diagnosis via HikariCP MBeans, pool metrics, server-side session inspection, and heap dump analysis.
+description: Diagnose and fix JDBC, R2DBC, and database connection pool leaks across Java, Kotlin, and Python. Use this skill whenever the user reports HikariCP `getConnection` timeouts, "Connection is not available, request timed out", `R2dbcTimeoutException`, R2DBC pool exhaustion or `usingWhen` / unsubscribed `Mono` leaks, `pg_stat_activity` showing idle-in-transaction climbing, MySQL `SHOW PROCESSLIST` filling with sleeping connections, SQLAlchemy "QueuePool limit overflow", asyncpg pool exhaustion, Hibernate `LazyInitializationException` co-occurring with pool exhaustion, Spring `@Transactional` / `open-in-view` symptoms, or any DB pool that drains under steady load. Covers source-code audit for missing close patterns, DataSource implementation matrix (Hikari / Tomcat / DBCP2 / c3p0), and live diagnosis via MBeans, server-side session inspection, heap dump analysis, and TestContainers reproduction harnesses.
 ---
 
 # Connection Leak: JDBC / DB Pools
@@ -125,7 +125,7 @@ async with pool.acquire() as conn:
 
 ### Java/Kotlin — R2DBC and reactive pools
 
-`r2dbc-pool` (`io.r2dbc.pool.ConnectionPool`) is the reactive analogue of HikariCP. The leak shapes are different because release is driven by **terminal signals** (`onComplete` / `onError` / `cancel`), not by `close()`. A `Mono<Connection>` that is never subscribed leaks no connection — but a `Connection` obtained inside a chain that never reaches a terminal signal pins the connection until the pool's `maxAcquireTime` (default 0 = forever).
+`r2dbc-pool` (`io.r2dbc.pool.ConnectionPool`) is the reactive analogue of HikariCP. The leak shapes are different because release is driven by **terminal signals** (`onComplete` / `onError` / `cancel`), not by `close()`. A `Mono<Connection>` that is never subscribed leaks no connection — but a `Connection` obtained inside a chain that never reaches a terminal signal pins the connection until the pool's `maxAcquireTime` elapses (default is unbounded — set it explicitly to a few seconds so leaks surface as `R2dbcTimeoutException` instead of pool exhaustion).
 
 ```sh
 # acquire without usingWhen/flatMap chain that terminates
@@ -171,40 +171,7 @@ log.info("acquired={} allocated={} idle={} pending={} maxAllocated={}",
 
 `acquiredSize` climbing while `idleSize` drains and `pendingAcquireSize > 0` for sustained periods = same leak signature as HikariCP, different API.
 
-For `reactor.netty.PoolAcquireTimeoutException` from R2DBC (rare — usually surfaces with a different message), it means a borrower waited longer than `maxAcquireTime` for a free connection: the pool is exhausted, exactly the same root cause as HikariCP `getConnection` timeout.
-
-### Reproduction harness — TestContainers
-
-Reproduce locally before deploying the fix. Pattern:
-
-```java
-@Testcontainers
-class ConnectionLeakReproTest {
-    @Container
-    static PostgreSQLContainer<?> pg = new PostgreSQLContainer<>("postgres:15-alpine");
-
-    @Test
-    void suspectedLeakReturnsConnectionsToBaseline() throws Exception {
-        HikariConfig cfg = new HikariConfig();
-        cfg.setJdbcUrl(pg.getJdbcUrl());
-        cfg.setUsername(pg.getUsername());
-        cfg.setPassword(pg.getPassword());
-        cfg.setMaximumPoolSize(4);
-        cfg.setLeakDetectionThreshold(2_000);  // 2s — fires fast in tests
-        try (HikariDataSource ds = new HikariDataSource(cfg)) {
-            UnderTest svc = new UnderTest(ds);
-            for (int i = 0; i < 200; i++) {
-                try { svc.doWorkThatMightLeak(i); } catch (Exception ignored) {}
-            }
-            // give housekeeper a tick to reap any in-flight close
-            Thread.sleep(500);
-            assertThat(ds.getHikariPoolMXBean().getActiveConnections()).isZero();
-        }
-    }
-}
-```
-
-A test that **fails today** is the cheapest possible regression guard. Run the fix, watch the same test go green. Commit both.
+`R2dbcTimeoutException` ("Connection acquisition failed because pool is exhausted") is the R2DBC analogue of HikariCP's `getConnection` timeout. Same root cause, different exception type.
 
 ## Live-process diagnosis
 
@@ -220,7 +187,16 @@ spring.datasource.hikari.leak-detection-threshold: 30000  # 30s
 
 Once enabled, leak detection logs a stack trace of the thread that acquired a connection and held it past the threshold — that stack is your culprit.
 
-Read live pool state without a JMX client:
+If Actuator is on the classpath, the metrics endpoint exposes the same numbers in a simpler form:
+
+```sh
+kubectl exec -it <pod> -- curl -s localhost:8080/actuator/metrics/hikaricp.connections.active
+kubectl exec -it <pod> -- curl -s localhost:8080/actuator/metrics/hikaricp.connections.pending
+```
+
+`hikaricp.connections.pending > 0` for more than a burst window = pool exhausted; `hikaricp.connections.active` monotonically climbing across hours = real leak.
+
+Read live pool state without Actuator or a JMX client:
 
 ```sh
 kubectl exec -it <pod> -- jcmd 1 ManagementAgent.start_local
@@ -247,10 +223,10 @@ Not every project uses HikariCP. Same diagnosis flow, different attribute names:
 |---|---|---|---|---|
 | HikariCP | `com.zaxxer.hikari:type=Pool (*)` | `ActiveConnections` | `ThreadsAwaitingConnection` | `leakDetectionThreshold` (ms) |
 | Tomcat JDBC | `tomcat.jdbc:type=ConnectionPool,name=*` | `Active` | `WaitCount` | `removeAbandonedTimeout` + `removeAbandoned=true` + `logAbandoned=true` |
-| Apache DBCP2 | `org.apache.commons.dbcp2:name=*,type=BasicDataSource` | `NumActive` | `NumWaiters` | `removeAbandonedOnBorrow` / `removeAbandonedOnMaintenance` + `abandonedUsageTracking` |
+| Apache DBCP2 | `org.apache.commons.dbcp2:name=*,type=BasicDataSource` | `NumActive` | (no waiter gauge — observe `NumIdle`==0 with `NumActive`==`MaxTotal`) | `removeAbandonedOnBorrow` / `removeAbandonedOnMaintenance` + `abandonedUsageTracking` |
 | c3p0 | `com.mchange.v2.c3p0:type=PooledDataSource[*]` | `numBusyConnectionsDefaultUser` | `numThreadsAwaitingCheckoutDefaultUser` | `unreturnedConnectionTimeout` + `debugUnreturnedConnectionStackTraces=true` |
 
-The "leak-detection knob" column is the closest equivalent to HikariCP's stack-trace-on-overdue feature. Enable it in pre-prod, not prod — every overdue checkout pays the cost of an exception stack capture.
+Enable the leak-detection knob in pre-prod, not prod — every overdue checkout captures an exception stack, which is non-trivial overhead.
 
 ### Server-side session inspection
 
@@ -398,6 +374,39 @@ rg -n 'createEntityManager\(' --type java --type kotlin
 ```
 
 **JDBC inside `@Async` methods.** `@Async` runs on a different thread, so the transaction context from the caller is **not** propagated. The async method runs without a transaction and, if it uses JDBC, falls into the same self-invocation trap. Always re-annotate the async method with `@Transactional` (and confirm the executor's threads are sized for the extra pool pressure).
+
+### Reproduction harness — TestContainers
+
+Reproduce locally before deploying the fix:
+
+```java
+@Testcontainers
+class ConnectionLeakReproTest {
+    @Container
+    static PostgreSQLContainer<?> pg = new PostgreSQLContainer<>("postgres:15-alpine");
+
+    @Test
+    void suspectedLeakReturnsConnectionsToBaseline() throws Exception {
+        HikariConfig cfg = new HikariConfig();
+        cfg.setJdbcUrl(pg.getJdbcUrl());
+        cfg.setUsername(pg.getUsername());
+        cfg.setPassword(pg.getPassword());
+        cfg.setMaximumPoolSize(4);
+        cfg.setLeakDetectionThreshold(2_000);  // 2s — fires fast in tests
+        try (HikariDataSource ds = new HikariDataSource(cfg)) {
+            UnderTest svc = new UnderTest(ds);
+            for (int i = 0; i < 200; i++) {
+                try { svc.doWorkThatMightLeak(i); } catch (Exception ignored) {}
+            }
+            // give housekeeper a tick to reap any in-flight close
+            Thread.sleep(500);
+            assertThat(ds.getHikariPoolMXBean().getActiveConnections()).isZero();
+        }
+    }
+}
+```
+
+A test that fails today is the cheapest regression guard. Run the fix, watch it pass, commit both.
 
 ### Verification
 

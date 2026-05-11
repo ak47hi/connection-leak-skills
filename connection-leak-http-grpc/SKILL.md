@@ -1,6 +1,6 @@
 ---
 name: connection-leak-http-grpc
-description: Diagnose and fix HTTP and gRPC client connection leaks across Java, Kotlin, and Python. Use this skill whenever the user reports symptoms like socket count to a remote service climbing without bound, sockets stuck in CLOSE_WAIT or ESTABLISHED, Netty `LEAK: ByteBuf.release() was not called`, "ManagedChannel was not shutdown properly" warnings at process exit, gRPC stub creation per-request causing channel exhaustion, OkHttp `ResponseBody` not closed warnings, Apache HttpClient connection-pool exhaustion, aiohttp "Unclosed client session", httpx async client warnings, or `requests.Session` leaks. Covers source-code audit for response/body/channel close patterns and live diagnosis via `lsof`, `/proc/*/net/tcp`, Netty leak detector levels, async-profiler allocation tracing, and `py-spy` for Python.
+description: Diagnose and fix HTTP and gRPC client connection leaks across Java, Kotlin, and Python. Use this skill whenever the user reports socket count to a remote service climbing without bound, sockets stuck in CLOSE_WAIT or ESTABLISHED, Netty `LEAK: ByteBuf.release() was not called`, "ManagedChannel was not shutdown properly", gRPC stub creation per-request, OkHttp `ResponseBody` not closed, Apache HttpClient or HttpAsyncClient 5 connection-pool exhaustion, Spring WebClient / reactor-netty leaks (`PoolAcquireTimeoutException`, `PrematureCloseException`, `exchangeToMono` body-not-consumed), gRPC `ENHANCE_YOUR_CALM` / `too_many_pings` / keepalive misconfiguration, aiohttp "Unclosed client session", httpx async client warnings, or `requests.Session` leaks. Covers source-code audit for response/body/channel close patterns and live diagnosis via `lsof`, `/proc/*/net/tcp`, Netty leak detector, async-profiler allocation tracing, and `py-spy`.
 ---
 
 # Connection Leak: HTTP / gRPC
@@ -101,6 +101,21 @@ public void close() throws IOException {
 
 Mixed deployments (sync HttpClient 5 + async HttpAsyncClient 5 in the same service) confuse heap dumps — the class names differ (`CloseableHttpClient` vs `CloseableHttpAsyncClient`), so count both.
 
+### Java — `java.net.http.HttpClient` (JDK standard library)
+
+JDK 11+ HTTP client. Two non-obvious leak modes:
+
+**Executor not shut down.** `HttpClient.newBuilder().executor(...)` accepts an explicit executor; if you supply one, you own its shutdown. On JDK 17 `HttpClient` itself has no `close()` (added in JDK 21), so the executor is the only thing holding the I/O threads — see the Flink lifecycle template for the pattern. Forgetting this in a Spring `@PreDestroy` or similar shutdown hook leaves a `FixedThreadPool` (and its sockets) running until process exit.
+
+**Response body streams not consumed.** `HttpResponse.BodyHandlers.ofInputStream()` returns a `BodyHandler<InputStream>` whose stream must be fully read or explicitly closed — the underlying HTTP/2 stream stays open until then. `BodyHandlers.ofString()` and `ofByteArray()` consume the body for you and are safer defaults.
+
+```sh
+rg -n 'HttpClient\.newBuilder|HttpClient\.newHttpClient' --type java
+rg -n 'BodyHandlers\.ofInputStream' --type java -A 5
+```
+
+For Flink-specific use, see the lifecycle template in `connection-leak-flink` — closing the executor inside `RichFunction.close()` is the canonical pattern.
+
 ### Java/Kotlin — Spring WebClient / reactor-netty
 
 This is the dominant JVM HTTP-leak source in Spring shops on Spring 5.3+ / Spring Boot 2.4+. Reactor-Netty exposes a connection pool (`ConnectionProvider`) with strict release semantics: the connection returns to the pool only when the response body is **fully consumed or explicitly released**. Several patterns leak silently:
@@ -116,19 +131,19 @@ rg -n '\.retrieve\(\)' --type java --type kotlin -A 3
 Leak modes:
 
 ```java
-// LEAK #1 — body not consumed on early return
+// LEAK — exchangeToMono gives you the response object before the body is read;
+// returning Mono.empty() without consuming the body leaves the connection
+// borrowed from the pool indefinitely.
 public Mono<String> fetch(String url) {
-    return webClient.get().uri(url).retrieve()
-        .toEntity(String.class)
-        .flatMap(resp -> {
-            if (!resp.getStatusCode().is2xxSuccessful()) {
-                return Mono.empty();   // body buffer not released
-            }
-            return Mono.just(resp.getBody());
-        });
+    return webClient.get().uri(url).exchangeToMono(resp -> {
+        if (!resp.statusCode().is2xxSuccessful()) {
+            return Mono.empty();   // body NOT consumed — connection leaked
+        }
+        return resp.bodyToMono(String.class);
+    });
 }
 
-// FIX — releaseBody() on the discard path
+// FIX — releaseBody() on the discard path forces the pool release
 public Mono<String> fetch(String url) {
     return webClient.get().uri(url).exchangeToMono(resp -> {
         if (!resp.statusCode().is2xxSuccessful()) {
@@ -138,6 +153,8 @@ public Mono<String> fetch(String url) {
     });
 }
 ```
+
+(`retrieve().toEntity(...)` and `retrieve().bodyToMono(...)` are safer — they consume the body as part of the call. The leak surface is `exchangeToMono` / the deprecated `exchange()`, where you see the response before the body is read.)
 
 ```java
 // LEAK #2 — WebClient created per call site, each one allocates a ConnectionProvider
@@ -167,29 +184,6 @@ Leak signals from reactor-netty:
 - Reactor-Netty's own metric `reactor.netty.connection.provider.total.connections` climbing without bound = per-WebClient-instance leak.
 
 Streaming responses (`bodyToFlux(ByteBuffer.class)`) require the consumer to take every emission to completion or cancel the subscription. An abandoned `Flux` (no `.subscribe()` ever called) is a no-op; an abandoned `Disposable` from a subscribed `Flux` is a leak.
-
-### Java — gRPC keepalive misconfiguration as a leak amplifier
-
-A real gRPC leak (channel not shut down) is rare. The more common symptom — channels in `TRANSIENT_FAILURE` repeatedly recreated — is usually keepalive misconfiguration colliding with server-side limits.
-
-Default `gRPC-java` keepalive sends a HTTP/2 PING every `keepAliveTime` if there's no other traffic. If the client's `keepAliveTime` is shorter than the **server's** `permitKeepAliveTime` (default 5 min on grpc-java server), the server interprets the PINGs as a "too aggressive client" violation and sends `GOAWAY` with `ENHANCE_YOUR_CALM`. The client closes the channel and the underlying TCP connection — and the next RPC creates a fresh subchannel. From `lsof` this looks like a leak: ESTABLISHED count to the server fluctuates but the *count of distinct channel objects* in the heap grows because old ones aren't reclaimed promptly under load.
-
-```java
-// CORRECT — defaults that match grpc-java server defaults
-ManagedChannel channel = NettyChannelBuilder.forAddress(host, port)
-    .keepAliveTime(30, TimeUnit.SECONDS)   // server permit default is also conservative
-    .keepAliveTimeout(5, TimeUnit.SECONDS)
-    .keepAliveWithoutCalls(false)          // crucial: don't ping idle channels
-    .build();
-```
-
-Signals that you're in this hole, not a real leak:
-
-```sh
-grep -E 'ENHANCE_YOUR_CALM|too_many_pings|GOAWAY' <app-logs>
-```
-
-If you see those, fix keepalive before chasing FDs.
 
 ### Java — Netty / `ResourceLeakDetector`
 
@@ -243,6 +237,32 @@ ctx.run(() -> {
     }
 });
 ```
+
+#### Keepalive misconfiguration as a leak amplifier
+
+A real gRPC leak (channel not shut down) is rare. The more common symptom — channels in `TRANSIENT_FAILURE` repeatedly recreated — is usually keepalive misconfiguration colliding with server-side limits.
+
+Default `gRPC-java` keepalive sends a HTTP/2 PING every `keepAliveTime` if there's no other traffic. If the client's `keepAliveTime` is shorter than the **server's** `permitKeepAliveTime` (default 5 min on grpc-java server), the server interprets the PINGs as a "too aggressive client" violation and sends `GOAWAY` with `ENHANCE_YOUR_CALM`. The client closes the channel and the underlying TCP connection — and the next RPC creates a fresh subchannel. From `lsof` this looks like a leak: ESTABLISHED count fluctuates but distinct channel/subchannel objects in the heap grow because old ones aren't reclaimed promptly under load.
+
+```java
+// SAFE — only pings during active calls, so server's idle-keepalive policy can't trip
+ManagedChannel channel = NettyChannelBuilder.forAddress(host, port)
+    .keepAliveTime(30, TimeUnit.SECONDS)
+    .keepAliveTimeout(5, TimeUnit.SECONDS)
+    .keepAliveWithoutCalls(false)          // don't ping when idle — avoids ENHANCE_YOUR_CALM
+    .build();
+
+// If you must ping while idle, the rule is: client keepAliveTime >= server's
+// permitKeepAliveTime (grpc-java server default: 5 min). Otherwise expect GOAWAYs.
+```
+
+Signals that you're in this hole, not a real leak:
+
+```sh
+grep -E 'ENHANCE_YOUR_CALM|too_many_pings|GOAWAY' <app-logs>
+```
+
+If you see those, fix keepalive before chasing FDs.
 
 ### Kotlin — ktor
 

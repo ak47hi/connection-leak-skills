@@ -1,6 +1,6 @@
 ---
 name: connection-leak-flink
-description: Diagnose and fix connection and resource leaks in Apache Flink 1.18 jobs running on the Flink Kubernetes Operator. Use this skill whenever the user reports symptoms like climbing TaskManager FD count, "Too many open files" on TMs, slow `cancel` or `stop`, "Task did not exit gracefully", checkpoint duration steadily increasing, RocksDB iterator counts climbing, leaked Kafka producers/consumers across job restarts, AsyncIO function clients not shut down, or JDBC sinks holding connections after operator close. Covers `RichFunction` lifecycle audit (`open`/`close` symmetry), AsyncIO client lifecycle, Kafka and JDBC sink connectors, RocksDB iterator hygiene, and live diagnosis via TaskManager metrics, in-pod `jstack`, async-profiler, and `/proc` inspection.
+description: Diagnose and fix connection and resource leaks in Apache Flink 1.18 jobs (Java 17) running on the Flink Kubernetes Operator. Use this skill whenever the user reports symptoms like climbing TaskManager FD count, "Too many open files" on TMs, slow `cancel` or `stop`, "Task did not exit gracefully", checkpoint duration steadily increasing, RocksDB iterator counts climbing, leaked Kafka producers/consumers across job restarts, AsyncIO function clients not shut down, JDBC sinks holding connections after operator close, `AsyncSinkBase` / SinkV2 leaks (Kinesis, Firehose, DynamoDB, OpenSearch sinks), or third-party connector leaks (Elasticsearch `RestHighLevelClient`, Hive `HiveMetastoreClient`, Redis Jedis/Lettuce). Covers `RichFunction` lifecycle audit, AsyncIO/`AsyncSinkBase` lifecycle, operator chaining / slot sharing / TM JVM reuse implications, MiniCluster reproduction harnesses, and live diagnosis via TaskManager metrics, in-pod `jstack`, async-profiler, and `/proc` inspection.
 ---
 
 # Connection Leak: Flink Connectors / `RichFunction` Lifecycle
@@ -17,7 +17,7 @@ Flink leaks are almost always lifecycle bugs in operator code: a resource opened
 
 Three runtime shape decisions change who owns a resource and when it gets released. Get these right before reading any `open`/`close` code.
 
-**Operator chaining.** Operators in the same `OperatorChain` run on a single task thread, and the chain calls `close()` on each operator **in reverse order**. If operator A's `close()` throws, operators B and C in the chain are still closed, but the exception propagates and the surrounding `StreamTask.cleanup()` may skip downstream cleanup. The suppressed-exception chain pattern (see below) matters more in chained operators because one bad `close()` poisons the whole chain's release path. Disable chaining around high-risk operators with `.startNewChain()` or `.disableChaining()` if needed.
+**Operator chaining.** Operators in the same `OperatorChain` run on a single task thread, and the chain closes operators **in reverse order**. Flink suppresses subsequent exceptions onto the first so all operators still get their `close()` called — but the task reports as failed, the JM may retry it, and a flaky close in one operator turns into repeated reopen-without-release cycles on every other operator in the chain. The suppressed-exception chain pattern below mitigates this; disable chaining around high-risk operators with `.startNewChain()` or `.disableChaining()` when the risk is concentrated in one operator.
 
 **Slot sharing.** By default all operators in a job share one `SlotSharingGroup`, so they land in the same TM JVM slot — sharing the JVM, the classloader, and any static state. A leaked thread pool in operator X pins the slot for operators Y and Z too. Fence high-risk operators (custom AsyncIO clients, custom JDBC sinks) into their own group:
 
@@ -29,7 +29,7 @@ stream
         .slotSharingGroup("isolated-async");  // suspect operator gets its own slot
 ```
 
-**TM JVM reuse on the Flink Kubernetes Operator.** Pod recycling policy on the operator controls whether a TM JVM survives a job restart. If `taskmanager.process.size` and the operator's `flinkVersion` settings keep TMs alive across restarts (the default for reactive mode and standalone deployments), **resources leaked from prior job attempts pile up in the same JVM**. Every leak audit on the K8s operator must distinguish "leak during run" from "leak across restarts" — they have the same FD-graph shape but different fix paths. Force a TM restart between job runs to isolate:
+**TM JVM reuse.** Whether a TM JVM survives a job restart depends on deployment mode: session mode reuses TMs across jobs (and across restarts of the same job within the session); application mode on the Flink Kubernetes Operator typically tears down and recreates TM pods on each job restart, but custom `podTemplate` settings or the operator's `flinkVersion`-specific restart policy can flip that. **Resources leaked from prior job attempts pile up in the same JVM whenever the TM pod is reused.** Every leak audit on the K8s operator must distinguish "leak during run" from "leak across restarts" — they have the same FD-graph shape but different fix paths. Force a TM restart between job attempts to isolate:
 
 ```sh
 # in-pod: trigger a restart between job attempts when reproducing
@@ -176,24 +176,33 @@ Flink 1.18 SinkV2 includes `AsyncSinkBase` (used by Kinesis, Firehose, DynamoDB,
 - On `close()`, in-flight batches are **not** drained by default. Records buffered but never submitted are dropped. If the SDK client doesn't `close()` either, the underlying HTTP connection pool leaks.
 
 ```sh
-# find AsyncSinkBase subclasses that don't override close
-rg -l 'extends AsyncSinkWriter|extends AsyncSinkBase' --type java
-rg -L 'override fun close|public void close' <files-from-above>
+# find AsyncSinkWriter subclasses that don't have a close override
+rg -l 'extends AsyncSinkWriter' --type java | xargs rg -L 'public void close'
 ```
 
-Wrap the SDK client in your `AsyncSinkWriter.close()`:
+Close the SDK client in your subclass's `close()`. The base `AsyncSinkWriter.close()` already drains in-flight batches, so just chain it:
 
 ```java
 @Override
 public void close() {
-    // drain in-flight batches before closing the client
-    flush(true);   // forces immediate flush, blocking
-    sdkClient.close();
-    super.close();
+    super.close();        // base class drains buffered + in-flight requests
+    sdkClient.close();    // your responsibility — the base class doesn't know about your client
 }
 ```
 
-`flush(true)` is the SinkV2 affordance for draining; skipping it on `close()` is the common bug.
+The common bug is skipping `super.close()` and just closing the SDK client — that drops buffered records on cancel and can leave the I/O reactor with in-flight requests against a now-closed client.
+
+For AWS SDK v2 sinks specifically (Kinesis, Firehose, DynamoDB, S3), the SDK client wraps a `NettyNioAsyncHttpClient` with its own event loop and connection pool. Calling `sdkClient.close()` is what releases that — but if you constructed the HTTP client separately and passed it to the builder (a common pattern for shared HTTP config across multiple SDK clients), you own its lifecycle independently:
+
+```java
+SdkAsyncHttpClient httpClient = NettyNioAsyncHttpClient.builder().build();
+KinesisAsyncClient kinesis = KinesisAsyncClient.builder().httpClient(httpClient).build();
+// ...
+kinesis.close();        // does NOT close httpClient when client was supplied externally
+httpClient.close();     // must be explicit
+```
+
+When constructed inline (`httpClientBuilder(...)` instead of `httpClient(...)`), the SDK client owns its lifecycle and a single `kinesis.close()` is enough.
 
 ### Connector-specific callouts
 
@@ -430,7 +439,7 @@ A few notes that matter:
 
 - The "20" threshold isn't 0 — JVM warmup and the JUnit lifecycle open background FDs. Calibrate by running the test against a known-clean operator first; whatever delta that produces is your noise floor.
 - `assertThat(... < threshold)` is the assertion the fix has to satisfy. A failing version of this test is your regression guard.
-- For RocksDB iterator leaks, `getOpenFileDescriptorCount()` doesn't always catch them (RocksDB SST files are mmap'd, not necessarily counted as FDs). Use a heap-instance count instead: `assertThat(countLiveInstances(RocksIterator.class)).isZero()`.
+- For RocksDB iterator leaks, prefer a heap-instance count over FD count: `assertThat(countLiveInstances(RocksIterator.class)).isZero()`. The FD count picks up SST file handles (Flink's default RocksDB backend uses regular file I/O, which does consume FDs), but iterator-leak signal there is much noisier than checking live `RocksIterator` instances directly.
 - This harness reproduces **operator-level** leaks. TM JVM reuse leaks (resources surviving across restarts) need a different fixture — either run multiple jobs sequentially in the same `MiniCluster`, or do the test in-pod with `kubectl delete pod` between attempts.
 
 ### Verification
@@ -466,12 +475,16 @@ Standing alerts for Flink-specific leak signatures. Requires Flink's Prometheus 
     > 2 * avg_over_time(flink_jobmanager_job_lastCheckpointDuration[6h] offset 6h)
   for: 30m
 
-# Slow cancel — symptom of close() blocking on a resource that won't release
+# Slow cancel — symptom of close() blocking on a resource that won't release.
+# Flink doesn't expose job_state as a metric label, so derive from the Operator's
+# Kubernetes CR status instead:
 - alert: FlinkJobSlowCancel
   expr: |
-    flink_jobmanager_job_uptime{job_state="CANCELLING"} > 120
+    (time() - kube_flinkdeployment_status_jobstatus_state_timestamp{state="CANCELLING"}) > 120
   annotations:
-    summary: "Job stuck in CANCELLING > 2m — close() is blocking somewhere"
+    summary: "{{ $labels.name }} stuck CANCELLING > 2m — close() is blocking somewhere"
+# Requires kube-state-metrics with the FlinkDeployment CRD registered;
+# otherwise alert on tail of `flink_jobmanager_job_lastCheckpointDuration` not advancing.
 ```
 
 `deriv` (not `rate`) on a monotonic gauge so the alert recovers when a real restart resets the counter.
