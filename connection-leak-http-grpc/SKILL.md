@@ -286,12 +286,6 @@ Recent access records:
 
 Stack identifies the consumer. Disable paranoid after diagnosis — overhead is meaningful.
 
-For OkHttp specifically, use:
-
-```sh
--Dokhttp3.internal.connection.RealCall.allowRetries=false   # makes leaks louder
-```
-
 ### async-profiler — allocation site for sockets
 
 ```sh

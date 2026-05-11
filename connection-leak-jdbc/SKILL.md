@@ -187,7 +187,7 @@ kubectl exec -it <pod> -- jstack 1 > stack.txt
 # threads blocked on getConnection
 grep -B 2 -A 10 'HikariPool.*getConnection' stack.txt
 # threads holding a connection (look for JDBC driver frames + application frame)
-grep -B 2 -A 10 'PgConnection\|MysqlConnection' stack.txt
+grep -E -B 2 -A 10 'PgConnection|MysqlConnection' stack.txt
 ```
 
 A thread parked deep inside an HTTP client call while holding a `PgConnection` reference on its stack is the canonical "long-running transaction" leak.

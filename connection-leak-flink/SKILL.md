@@ -1,11 +1,13 @@
 ---
 name: connection-leak-flink
-description: Diagnose and fix connection and resource leaks in Apache Flink (1.18+) jobs running on the Flink Kubernetes Operator. Use this skill whenever the user reports symptoms like climbing TaskManager FD count, "Too many open files" on TMs, slow `cancel` or `stop`, "Task did not exit gracefully", checkpoint duration steadily increasing, RocksDB iterator counts climbing, leaked Kafka producers/consumers across job restarts, AsyncIO function clients not shut down, or JDBC sinks holding connections after operator close. Covers `RichFunction` lifecycle audit (`open`/`close` symmetry), AsyncIO client lifecycle, Kafka and JDBC sink connectors, RocksDB iterator hygiene, and live diagnosis via TaskManager metrics, in-pod `jstack`, async-profiler, and `/proc` inspection.
+description: Diagnose and fix connection and resource leaks in Apache Flink 1.18 jobs running on the Flink Kubernetes Operator. Use this skill whenever the user reports symptoms like climbing TaskManager FD count, "Too many open files" on TMs, slow `cancel` or `stop`, "Task did not exit gracefully", checkpoint duration steadily increasing, RocksDB iterator counts climbing, leaked Kafka producers/consumers across job restarts, AsyncIO function clients not shut down, or JDBC sinks holding connections after operator close. Covers `RichFunction` lifecycle audit (`open`/`close` symmetry), AsyncIO client lifecycle, Kafka and JDBC sink connectors, RocksDB iterator hygiene, and live diagnosis via TaskManager metrics, in-pod `jstack`, async-profiler, and `/proc` inspection.
 ---
 
 # Connection Leak: Flink Connectors / `RichFunction` Lifecycle
 
 Assumes cross-cutting triage from `connection-leak-hunt` is done — leak is confirmed on a TaskManager (TM), not the JobManager.
+
+**Runtime assumed:** Apache Flink 1.18 on Java 17. Code samples use Java 17 idioms (e.g. JEP 394 pattern-matching `instanceof`). Flink 1.18 also supports Java 8/11; on those, rewrite pattern variables to classic `instanceof` + cast.
 
 Flink leaks are almost always lifecycle bugs in operator code: a resource opened in `open()` (or lazily) and not released in `close()`. The Flink runtime calls `close()` on graceful shutdown but **does not** call it on `cancel`, on TM kill, or on uncaught exceptions during checkpoint — so leaked resources from prior job attempts can pile up across restarts on the same TM JVM if the TM is reused.
 
@@ -101,7 +103,8 @@ Audit:
 public void timeout(IN input, ResultFuture<OUT> resultFuture) throws Exception {
     // cancel the underlying request — without this, the client may hold the socket
     // until its own timeout, far beyond the Flink timeout
-    pendingRequests.get(input)?.cancel(true);
+    CompletableFuture<?> pending = pendingRequests.get(input);
+    if (pending != null) pending.cancel(true);
     resultFuture.complete(Collections.emptyList());
 }
 ```
@@ -284,7 +287,8 @@ public class MyEnrichmentFn extends RichAsyncFunction<In, Out> {
         try {
             inFlight.values().forEach(f -> f.cancel(true));
         } finally {
-            // HttpClient in JDK 11+ has no close(); cast and shutdown executor instead
+            // java.net.http.HttpClient gained close() only in JDK 21;
+            // on Java 17 you must shut down its executor explicitly.
             if (client.executor().orElse(null) instanceof ExecutorService es) {
                 es.shutdownNow();
                 es.awaitTermination(5, TimeUnit.SECONDS);
