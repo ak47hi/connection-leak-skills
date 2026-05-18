@@ -19,7 +19,7 @@ Each child skill assumes the cross-cutting triage in `connection-leak-hunt` has 
 One-shot from a fresh clone:
 
 ```sh
-git clone https://github.com/<your-fork>/connection-leak-skills.git
+git clone https://github.com/ak47hi/connection-leak-skills.git
 cd connection-leak-skills
 ./install.sh
 ```
