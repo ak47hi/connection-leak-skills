@@ -48,7 +48,7 @@ if [ "$MODE" != "uninstall" ]; then
   for skill in "${SKILLS[@]}"; do
     if [ ! -f "$SCRIPT_DIR/$skill/SKILL.md" ]; then
       echo "Error: $SCRIPT_DIR/$skill/SKILL.md not found." >&2
-      echo "Run install.sh from the repo root (where the four connection-leak-* folders live)." >&2
+      echo "install.sh must live alongside the four connection-leak-* folders; \$SCRIPT_DIR was $SCRIPT_DIR." >&2
       exit 1
     fi
   done
